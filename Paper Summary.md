@@ -15,21 +15,19 @@
   1. 来自**Non-local**模块的**全局描述子**（用于快速候选召回）；
   2. 由**CSMG（Cluster Similarity Masking Graph）**编码器产生的**结构化半全局（场景图）描述子**（用于精匹配）。两者**层级式粗到细**检索。 
 
----
-
 ## 网络结构（实现要点）
 
 * **Backbone**：预训练 **VGG-16 或 ResNet-50 的前四个 block**。作者将 **Conv5** 用 **Non-local Block** 替换，并在 Non-local 前后加**通道自适应Conv**与**MaxPool**。 
-* **全局分支**：Non-local 输出张量 (x_g \in \mathbb{R}^{256\times14\times14})，**直接展平**为全局描述子 (\Omega)。
+* **全局分支**：Non-local 输出张量 $x_g \in \mathbb{R}^{256\times14\times14}$，**直接展平**为全局描述子 $\Omega$。
 * **CSMG 半全局分支**（NetVLAD改造）：
 
-  * 不再求“特征−聚类中心残差”之和（NetVLAD），而是对与聚类中心相似的特征做**相似度加权聚合**，得到每簇的**共识特征**与**节点描述子 (d_k)**；同时恢复其在图像平面上的**空间分布**并**按覆盖面积排序后再展平**，形成结构感知的扁平向量。  
+  * 不再求“特征−聚类中心残差”之和（NetVLAD），而是对与聚类中心相似的特征做**相似度加权聚合**，得到每簇的**共识特征**与**节点描述子 $d_k$**；同时恢复其在图像平面上的**空间分布**并**按覆盖面积排序后再展平**，形成结构感知的扁平向量。  
   * **关键公式**：
 
-    * 相似度掩膜：(X^{*}(k,i)=\mathrm{ReLU}(c_k^\top x_i)\odot x_i)。
-    * 节点描述子：(d_k=\sum_i X^{*}(k,i))。
-    * 全局描述子：(\Omega=\mathrm{Flatten}(x_g))。
-  * **实现提示**：相似度张量 (S\in\mathbb{R}^{B\times K\times N}) 可用 `torch.bmm` 计算；用 ReLU 去除非正相似度，保证端到端可导；随后与特征 X 做按元素乘积得到掩膜特征。
+    * 相似度掩膜：$X^{*}(k,i)=\mathrm{ReLU}(c_k^\top x_i)\odot x_i$。
+    * 节点描述子：$d_k=\sum_i X^{*}(k,i)$。
+    * 全局描述子：$\Omega=\mathrm{Flatten}(x_g)$。
+  * **实现提示**：相似度张量 $S\in\mathbb{R}^{B\times K\times N}$ 可用 `torch.bmm` 计算；用 ReLU 去除非正相似度，保证端到端可导；随后与特征 X 做按元素乘积得到掩膜特征。
 * **描述子维度**：每个半全局节点的维度 **D = 256**（沿用 NetVLAD 推荐），故**最终半全局向量维度 = K × 256**。
 
 ---
@@ -37,9 +35,9 @@
 ## 训练目标与采样
 
 * **损失函数**：提出**余弦三元组损失**（将 NetVLAD 的 L2 距离替换为 **cosine**），并与**全局分支的余弦嵌入损失**加权求和：
-  [
-  L=\beta,L^{\Omega}*{\text{cos}} + (1-\beta),L*{\text{cos}},\quad \beta=0.5\ (\text{默认})
-  ]
+  $$
+  L=\beta L^{\Omega}_{\text{cos}} + (1-\beta)L^{f}_{\text{cos}},\quad \beta=0.5\ (\text{默认})
+  $$
   用于**同时训练全局与半全局**两条分支。 
 * **三元组构造**：Anchor 来自**卫星图**，正/负样本来自**UAV图**；弱监督排序损失思想沿用 NetVLAD。 
 
@@ -88,19 +86,19 @@
 
    * Backbone 前四个block → **Non-local**（含通道适配Conv+MaxPool）并**分岔**：
 
-     * **全局**：`Flatten(NonLocalOut)` → (\Omega)。
-     * **半全局**：将同一特征图送入 **CSMG**：用 **`torch.bmm`** 计算 (S=c^\top x)，**ReLU** 掩膜 → 聚合得到 (\Phi=[d_1,\dots,d_K]) → **按节点覆盖面积排序并展平**。 
+     * **全局**：`Flatten(NonLocalOut)` → $\Omega$。
+     * **半全局**：将同一特征图送入 **CSMG**：用 **`torch.bmm`** 计算 $S=c^\top x$，**ReLU** 掩膜 → 聚合得到 $\Phi=[d_1,\dots,d_K]$ → **按节点覆盖面积排序并展平**。 
 3. **损失**
 
-   * **Cosine Triplet**（半全局向量 (f)）+ **Global Cosine Embedding**（(\Omega)）；**(\beta=0.5)**。
+   * **Cosine Triplet**（半全局向量 (f)）+ **Global Cosine Embedding**（$\Omega$）；**$\beta=0.5$**。
 4. **优化/调参**
 
    * **Adam(lr=1e-3), batch=128, epoch≈100**；K从 ([4,6]) 试起；关注80 epoch 后收敛与过拟合迹象。 
 5. **检索与评测**
 
-   * 先用 (\Omega) 对库做**Top-N召回**（点积相似度）；再用展平且排序后的 (\Phi) 做**余弦相似度**排序；统计 **R@1/R@5**。 
+   * 先用 $\Omega$ 对库做**Top-N召回**（点积相似度）；再用展平且排序后的 $\Phi$ 做**余弦相似度**排序；统计 **R@1/R@5**。
 
----
+
 
 ## 复现时的坑与注意
 

@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
 import argparse
 import json
-import math
 import os
 import random
 import time
@@ -14,7 +12,6 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms, models
 
 from sceneGraphEncodingNet.nets import CSMG, JointNet
-from sceneGraphEncodingNet import model_eval as eval_utils
 
 
 def set_seed(seed: int = 42):
@@ -83,15 +80,28 @@ def forward_descriptors(model, images):
 
     d_tensor = x_star.sum(dim=-1)
     d_tensor = F.normalize(d_tensor, p=2, dim=2)
-    semi_desc = F.normalize(d_tensor.view(b, -1), p=2, dim=1)
+    cluster_mass = soft_assign.sum(dim=2)
+    sort_idx = torch.argsort(cluster_mass, dim=1, descending=True)
+    gather_idx = sort_idx.unsqueeze(-1).expand(-1, -1, d_tensor.size(-1))
+    d_sorted = torch.gather(d_tensor, 1, gather_idx)
+    semi_desc = F.normalize(d_sorted.reshape(b, -1), p=2, dim=1)
     return global_desc, semi_desc
 
 
-def cosine_triplet_loss(anchor, positive, negative, margin):
-    pos = F.cosine_similarity(anchor, positive)
-    neg = F.cosine_similarity(anchor, negative)
-    loss = F.relu(margin + neg - pos)
-    return loss.mean()
+class CosineTripletLoss(nn.Module):
+    """Cosine triplet loss with margin."""
+
+    def __init__(self, margin: float = 0.2):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, anchor, positive, negative):
+        a = F.normalize(anchor, p=2, dim=1)
+        p = F.normalize(positive, p=2, dim=1)
+        n = F.normalize(negative, p=2, dim=1)
+        pos = torch.sum(a * p, dim=1)
+        neg = torch.sum(a * n, dim=1)
+        return F.relu(self.margin + neg - pos).mean()
 
 
 class TripletDataset(Dataset):
@@ -131,7 +141,7 @@ class TripletDataset(Dataset):
 
 def build_transforms(image_size=224):
     train_tf = transforms.Compose([
-        transforms.Resize((256, 256)),
+        transforms.Resize((256, 256), interpolation=3),
         transforms.RandomCrop((image_size, image_size), padding=16, padding_mode="reflect"),
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
@@ -140,7 +150,7 @@ def build_transforms(image_size=224):
                              std=[0.229, 0.224, 0.225]),
     ])
     test_tf = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
+        transforms.Resize((image_size, image_size), interpolation=3),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
@@ -155,15 +165,110 @@ def save_checkpoint(state, checkpoint_dir, prefix):
     return path
 
 
-def evaluate(model, device, ref_dir, query_dir):
-    net = unwrap(model).eval()
-    ref = eval_utils.load_ref_img(net, device, ref_dir)
-    recall_results, scores = eval_utils.recall(net, device, ref, query_dir)
-    return scores, recall_results
+def two_stage_recall(
+    model,
+    device,
+    ref_dir,
+    query_dir,
+    transform,
+    top_n=50,
+    ref_batch_size=32,
+    query_batch_size=32,
+):
+    ref_dataset = datasets.ImageFolder(ref_dir, transform=transform)
+    query_dataset = datasets.ImageFolder(query_dir, transform=transform)
+    if ref_dataset.classes != query_dataset.classes:
+        raise RuntimeError("Reference and query datasets must share the same class set.")
+
+    ref_loader = DataLoader(
+        ref_dataset,
+        batch_size=ref_batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+    query_loader = DataLoader(
+        query_dataset,
+        batch_size=query_batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    model.eval()
+    ref_global_feats = []
+    ref_semi_feats = []
+    ref_labels = []
+    with torch.no_grad():
+        for images, labels in ref_loader:
+            images = images.to(device, non_blocking=True)
+            global_vec, semi_vec = forward_descriptors(model, images)
+            ref_global_feats.append(global_vec.detach())
+            ref_semi_feats.append(semi_vec.detach())
+            ref_labels.extend(labels.tolist())
+
+    if not ref_labels:
+        raise RuntimeError("Reference dataset is empty.")
+
+    ref_global = torch.cat(ref_global_feats, dim=0)
+    ref_semi = torch.cat(ref_semi_feats, dim=0)
+    ref_labels_tensor = torch.tensor(ref_labels, device=ref_global.device)
+
+    top1_counter = 0
+    top5_counter = 0
+    total_counter = 0
+    recall_records = []
+    class_names = ref_dataset.classes
+
+    with torch.no_grad():
+        for images, labels in query_loader:
+            if images.size(0) == 0:
+                continue
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            global_q, semi_q = forward_descriptors(model, images)
+
+            sim_global = torch.matmul(global_q, ref_global.t())
+            k = min(top_n, sim_global.size(1))
+            _, top_indices = sim_global.topk(k=k, dim=1, largest=True, sorted=True)
+
+            for idx_in_batch in range(images.size(0)):
+                candidates = top_indices[idx_in_batch]
+                candidate_semi = ref_semi.index_select(0, candidates)
+                scores = torch.matmul(candidate_semi, semi_q[idx_in_batch])
+                rerank = torch.argsort(scores, descending=True)
+                ranked_indices = candidates[rerank]
+
+                final_indices = ranked_indices[:5]
+                gt_label = labels[idx_in_batch]
+                total_counter += 1
+
+                if final_indices.numel() > 0 and ref_labels_tensor[final_indices[0]] == gt_label:
+                    top1_counter += 1
+                if final_indices.numel() > 0:
+                    matched = ref_labels_tensor.index_select(0, final_indices)
+                    if (matched == gt_label).any():
+                        top5_counter += 1
+
+                record = {
+                    "query_label": class_names[gt_label.item()],
+                    "top_matches": [
+                        class_names[ref_labels_tensor[i].item()] for i in final_indices
+                    ],
+                }
+                recall_records.append(record)
+
+    accuracy = {
+        "R1": 100.0 * top1_counter / total_counter if total_counter else 0.0,
+        "R5": 100.0 * top5_counter / total_counter if total_counter else 0.0,
+    }
+    return accuracy, recall_records
 
 
 def train_epoch(model, loader, optimizer, device, scaler, beta, margin, log_interval):
     model.train()
+    cos_triplet = CosineTripletLoss(margin=margin).to(device)
+    cos_embedding = nn.CosineEmbeddingLoss(margin=margin).to(device)
     running_loss = 0.0
     for step, batch in enumerate(loader, 1):
         anchors, positives, negatives, _ = batch
@@ -172,13 +277,15 @@ def train_epoch(model, loader, optimizer, device, scaler, beta, margin, log_inte
         negatives = negatives.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=scaler is not None):
-            ga, sa = forward_descriptors(model, anchors)
-            gp, sp = forward_descriptors(model, positives)
-            gn, sn = forward_descriptors(model, negatives)
+        with torch.amp.autocast('cuda', enabled=scaler is not None):
+            ga, fa = forward_descriptors(model, anchors)
+            gp, fp = forward_descriptors(model, positives)
+            gn, fn = forward_descriptors(model, negatives)
 
-            loss_global = cosine_triplet_loss(ga, gp, gn, margin)
-            loss_semi = cosine_triplet_loss(sa, sp, sn, margin)
+            y_pos = torch.ones(ga.size(0), device=device)
+            y_neg = -torch.ones(ga.size(0), device=device)
+            loss_global = cos_embedding(ga, gp, y_pos) + cos_embedding(ga, gn, y_neg)
+            loss_semi = cos_triplet(fa, fp, fn)
             loss = beta * loss_global + (1.0 - beta) * loss_semi
 
         if scaler is not None:
@@ -199,16 +306,17 @@ def train_epoch(model, loader, optimizer, device, scaler, beta, margin, log_inte
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train SGM-Net")
-    parser.add_argument("--dataset-root", required=True, help="Root folder of University-Release.")
+    parser.add_argument("--dataset-root", default="./data", help="Root folder of University-Release.")
     parser.add_argument("--train-sat-subdir", default="train/gallery_satellite")
     parser.add_argument("--train-drone-subdir", default="train/query_drone")
     parser.add_argument("--val-sat-subdir", default="val/gallery_satellite")
     parser.add_argument("--val-drone-subdir", default="val/query_drone")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--steps-per-epoch", type=int, default=2000)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--device_id", default="1")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--steps_per_epoch", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--margin", type=float, default=0.2)
     parser.add_argument("--beta", type=float, default=0.5, help="Weight on global loss.")
     parser.add_argument("--alpha", type=float, default=1.0, help="CSMG scaling factor.")
@@ -252,7 +360,7 @@ def main():
     graph_head = CSMG(input_channel=out_channels, num_clusters=args.num_clusters, alpha=args.alpha)
     model = JointNet(backbone, graph_head)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{args.device_id}" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
@@ -262,7 +370,7 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scaler = torch.cuda.amp.GradScaler() if args.mixed_precision and device.type == "cuda" else None
+    scaler = torch.amp.GradScaler('cuda') if args.mixed_precision and device.type == "cuda" else None
     start_epoch = 0
     metrics_history = []
 
@@ -295,7 +403,16 @@ def main():
             val_sat = os.path.join(args.dataset_root, args.val_sat_subdir)
             val_drone = os.path.join(args.dataset_root, args.val_drone_subdir)
             if os.path.exists(val_sat) and os.path.exists(val_drone):
-                scores, _ = evaluate(model, device, val_sat, val_drone)
+                scores, _ = two_stage_recall(
+                    model,
+                    device,
+                    val_sat,
+                    val_drone,
+                    transform=eval_tf,
+                    top_n=50,
+                    ref_batch_size=args.batch_size,
+                    query_batch_size=args.batch_size,
+                )
                 print(f"[eval] R@1={scores['R1']:.2f} R@5={scores['R5']:.2f}")
                 metrics_history.append({"epoch": epoch + 1, "scores": scores})
             else:
