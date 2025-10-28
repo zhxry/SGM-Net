@@ -1,6 +1,9 @@
 SGM-Net.txt
 AGENTS.md
 train2.py
+nohup.out
+*.csv
+*.zip
 
 data/
 log/

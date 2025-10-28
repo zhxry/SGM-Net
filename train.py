@@ -135,16 +135,17 @@ class TripletDataset(Dataset):
 
         anchor_img, _ = self.sat_dataset[random.choice(self.sat_by_class[anchor_cls])]
         positive_img, _ = self.drone_dataset[random.choice(self.drone_by_class[anchor_cls])]
-        negative_img, _ = self.drone_dataset[random.choice(self.drone_by_class[negative_cls])]
-        return anchor_img, positive_img, negative_img, anchor_cls
+        neg_index = random.choice(self.drone_by_class[negative_cls])
+        negative_img, _ = self.drone_dataset[neg_index]
+        return anchor_img, positive_img, negative_img, anchor_cls, negative_cls
 
 
 def build_transforms(image_size=224):
     train_tf = transforms.Compose([
         transforms.Resize((256, 256), interpolation=3),
         transforms.RandomCrop((image_size, image_size), padding=16, padding_mode="reflect"),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
+        # transforms.RandomHorizontalFlip(),
+        # transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),  # 调小或移除
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
@@ -269,12 +270,31 @@ def train_epoch(model, loader, optimizer, device, scaler, beta, margin, log_inte
     model.train()
     cos_triplet = CosineTripletLoss(margin=margin).to(device)
     cos_embedding = nn.CosineEmbeddingLoss(margin=margin).to(device)
+    total_loss = 0.0
     running_loss = 0.0
+
+    def mine_hard_negatives(anchor_feat, candidate_feat, anchor_labels, candidate_labels):
+        sim = torch.matmul(anchor_feat.float(), candidate_feat.float().t())
+        mask = anchor_labels.unsqueeze(1) != candidate_labels.unsqueeze(0)
+        sim = sim.masked_fill(~mask, -1e9)
+        hard_idx = sim.argmax(dim=1)
+        # fallback: if no valid negative, use paired random negative
+        no_valid = ~mask.any(dim=1)
+        if no_valid.any():
+            base = candidate_feat.size(0) - anchor_feat.size(0)
+            fallback = base + torch.arange(
+                anchor_feat.size(0), device=anchor_feat.device, dtype=torch.long
+            )
+            hard_idx = torch.where(no_valid, fallback, hard_idx)
+        return candidate_feat[hard_idx], hard_idx
+
     for step, batch in enumerate(loader, 1):
-        anchors, positives, negatives, _ = batch
+        anchors, positives, negatives, anchor_labels, negative_labels = batch
         anchors = anchors.to(device, non_blocking=True)
         positives = positives.to(device, non_blocking=True)
         negatives = negatives.to(device, non_blocking=True)
+        anchor_labels = anchor_labels.to(device, non_blocking=True)
+        negative_labels = negative_labels.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast('cuda', enabled=scaler is not None):
@@ -282,10 +302,20 @@ def train_epoch(model, loader, optimizer, device, scaler, beta, margin, log_inte
             gp, fp = forward_descriptors(model, positives)
             gn, fn = forward_descriptors(model, negatives)
 
+            candidate_global = torch.cat([gp, gn], dim=0)
+            candidate_semi = torch.cat([fp, fn], dim=0)
+            candidate_labels = torch.cat([anchor_labels, negative_labels], dim=0)
+
+            hard_semi, hard_idx = mine_hard_negatives(fa, candidate_semi, anchor_labels, candidate_labels)
+            hard_global = candidate_global[hard_idx]
+
             y_pos = torch.ones(ga.size(0), device=device)
             y_neg = -torch.ones(ga.size(0), device=device)
-            loss_global = cos_embedding(ga, gp, y_pos) + cos_embedding(ga, gn, y_neg)
-            loss_semi = cos_triplet(fa, fp, fn)
+            loss_global_pos = cos_embedding(ga, gp, y_pos)
+            loss_global_neg = cos_embedding(ga, hard_global, y_neg)
+            # loss_global = 0.5 * (loss_global_pos + loss_global_neg)
+            loss_global = cos_triplet(ga, gp, hard_global)
+            loss_semi = cos_triplet(fa, fp, hard_semi)
             loss = beta * loss_global + (1.0 - beta) * loss_semi
 
         if scaler is not None:
@@ -297,16 +327,17 @@ def train_epoch(model, loader, optimizer, device, scaler, beta, margin, log_inte
             optimizer.step()
 
         running_loss += loss.item()
+        total_loss += loss.item()
         if log_interval and step % log_interval == 0:
             avg = running_loss / log_interval
             print(f"[train] step={step:05d} loss={avg:.4f}")
             running_loss = 0.0
-    return running_loss
+    return total_loss / len(loader)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train SGM-Net")
-    parser.add_argument("--dataset-root", default="./data", help="Root folder of University-Release.")
+    parser.add_argument("--dataset-root", default="./data/University-1652", help="Root folder of University-Release.")
     parser.add_argument("--train-sat-subdir", default="train/gallery_satellite")
     parser.add_argument("--train-drone-subdir", default="train/query_drone")
     parser.add_argument("--val-sat-subdir", default="val/gallery_satellite")
@@ -316,19 +347,20 @@ def parse_args():
     parser.add_argument("--steps_per_epoch", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--margin", type=float, default=0.2)
     parser.add_argument("--beta", type=float, default=0.5, help="Weight on global loss.")
     parser.add_argument("--alpha", type=float, default=1.0, help="CSMG scaling factor.")
-    parser.add_argument("--num-clusters", type=int, default=4)
+    parser.add_argument("--num_clusters", type=int, default=4)
     parser.add_argument("--backbone", choices=["vgg16", "resnet50"], default="vgg16")
-    parser.add_argument("--no-freeze-backbone", action="store_true")
-    parser.add_argument("--mixed-precision", action="store_true")
-    parser.add_argument("--eval-interval", type=int, default=5)
-    parser.add_argument("--output-dir", default="./checkpoints")
+    parser.add_argument("--no_freeze_backbone", action="store_true")
+    parser.add_argument("--mixed_precision", action="store_true")
+    parser.add_argument("--eval_interval", type=int, default=5)
+    parser.add_argument("--output_dir", default="./checkpoints")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--log-interval", type=int, default=20)
+    parser.add_argument("--log_interval", type=int, default=100)
+    parser.add_argument("--ckpt_interval", type=int, default=5)
     return parser.parse_args()
 
 
@@ -409,7 +441,7 @@ def main():
                     val_sat,
                     val_drone,
                     transform=eval_tf,
-                    top_n=50,
+                    top_n=100,
                     ref_batch_size=args.batch_size,
                     query_batch_size=args.batch_size,
                 )
@@ -427,8 +459,9 @@ def main():
             "args": vars(args),
             "timestamp": time.time(),
         }
-        ckpt_path = save_checkpoint(state, args.output_dir, f"sgm_net_epoch_{epoch+1:03d}")
-        print(f"[checkpoint] saved to {ckpt_path}")
+        if (epoch + 1) % args.ckpt_interval == 0 or (epoch + 1) == args.epochs:
+            ckpt_path = save_checkpoint(state, args.output_dir, f"sgm_net_epoch_{epoch+1:03d}")
+            print(f"[checkpoint] saved to {ckpt_path}")
 
     hist_path = os.path.join(args.output_dir, "training_history.json")
     with open(hist_path, "w", encoding="utf-8") as f:
